@@ -12,165 +12,251 @@ interface IBlockSwap {
 }
 
 /**
- * BlockLend — Stage 3: adds liquidations on top of Stage 1's core
- * mechanics and Stage 2's interest accrual.
+ * BlockLend — full multi-asset version: USDC, EURC, cirBTC, and BLOCK
+ * can each be deposited to earn interest AND borrowed against
+ * collateral posted in any of the other three.
  *
- * A position becomes liquidatable once its debt exceeds 75% of its
- * collateral's value (a real buffer above the 66% max-borrow limit,
- * so ordinary interest accrual doesn't immediately put a healthy
- * borrower at risk). Anyone can then repay part or all of that debt
- * on the borrower's behalf and receive their proportional collateral
- * back PLUS an 8% bonus — the real incentive that makes liquidators
- * actually show up when a position goes unsafe, the same mechanism
- * every major lending protocol relies on.
+ * This is a genuinely large step up in complexity from the
+ * USDC-only version, for a real reason: each asset now needs its own
+ * independent lending pool (its own share accounting, its own
+ * interest index) rather than one shared pool. A position's
+ * collateral can be posted in a DIFFERENT asset than what's borrowed
+ * against it, which means valuing that collateral correctly now
+ * sometimes requires reading TWO separate BlockSwap pool prices and
+ * converting through USDC as an intermediate step (the same two-hop
+ * routing your Swap page already does for non-USDC pairs) — doubling
+ * the oracle-manipulation exposure already documented as this
+ * contract's single biggest weakness in every earlier version.
  *
- * REAL, HONEST LIMITATIONS — still true even with this stage added:
+ * USDC remains special-cased throughout: it's the hub every BlockSwap
+ * pool is already built around, so it never needs a price conversion
+ * step, while EURC/cirBTC/BLOCK always do when paired against each
+ * other.
  *
- * 1. Price oracle is still your own thin BlockSwap pools. A large
- *    enough swap can move a token's price before this contract reads
- *    it — meaning both borrowing power AND liquidation eligibility
- *    can be manipulated by someone with enough capital to move the
- *    pool temporarily. This is the single biggest reason this
- *    contract isn't safe for real value without a proper external
- *    price oracle.
- * 2. "Bad debt" isn't handled. If a collateral's price crashes fast
- *    enough that even seizing 100% of it doesn't cover the debt, the
- *    liquidator gets capped at whatever collateral actually exists —
- *    the shortfall becomes a real loss for lenders, silently. Real
- *    protocols address this with insurance funds or backstop
- *    mechanisms; this version does not.
- * 3. No liquidation is guaranteed to happen promptly — it depends on
- *    someone actually noticing and acting, same as any permissionless
- *    liquidation system.
+ * REAL, HONEST LIMITATIONS — still true, now more consequential:
+ *
+ * 1. Price oracle is still your own thin BlockSwap pools. This risk
+ *    directly scales with this version, since two-hop valuations
+ *    compound the manipulation surface of a single swap.
+ * 2. Bad debt still isn't backstopped in any pool.
+ * 3. A position still holds ONE collateral type and ONE borrowed
+ *    asset at a time (not simultaneous multi-collateral or
+ *    multi-borrow) — kept this restriction deliberately, since
+ *    lifting it too is a substantially bigger undertaking on top of
+ *    everything else already added here.
  */
 contract BlockLend {
-    IERC20 public immutable usdc;
-    IBlockSwap public immutable swapContract;
+    address public immutable usdc;
+    IBlockSwap public swapContract;
     address public owner;
+    bool public paused;
 
-    uint256 public constant LTV_BPS = 6600; // 66% max borrow against collateral
-    uint256 public constant LIQUIDATION_THRESHOLD_BPS = 7500; // 75% — liquidatable above this
-    uint256 public constant LIQUIDATION_BONUS_BPS = 800; // 8% bonus to the liquidator
+    uint256 public ltvBps = 6600;
+    uint256 public liquidationThresholdBps = 7500;
+    uint256 public liquidationBonusBps = 800;
+    uint256 public borrowAprBps = 800;
+    uint256 public maxUtilizationBps = 8500;
+
     uint256 public constant SECONDS_PER_YEAR = 365 days;
-    uint256 public constant BORROW_APR_BPS = 800; // 8% annual interest on borrowed USDC
     uint256 constant INDEX_PRECISION = 1e18;
 
-    uint256 public totalShares;
-    uint256 public totalPoolValue;
-    mapping(address => uint256) public lenderShares;
-
-    uint256 public borrowIndex = INDEX_PRECISION;
-    uint256 public totalBorrowPrincipalScaled;
-    uint256 public lastAccrualTime;
+    // One independent pool per asset — USDC, EURC, cirBTC, and BLOCK
+    // each accrue interest and track lender shares completely
+    // separately from one another.
+    struct AssetPool {
+        uint256 totalShares;
+        uint256 totalPoolValue;
+        uint256 borrowIndex;
+        uint256 totalBorrowPrincipalScaled;
+        uint256 lastAccrualTime;
+        bool initialized;
+    }
+    mapping(address => AssetPool) public pools; // asset => pool
+    mapping(address => mapping(address => uint256)) public lenderShares; // asset => lender => shares
 
     struct Position {
         address collateralToken;
         uint256 collateralAmount;
-        uint256 borrowScaled;
+        address borrowedAsset;
+        uint256 borrowScaled; // scaled against borrowedAsset's pool borrowIndex
     }
     mapping(address => Position) public positions;
 
-    event Deposited(address indexed lender, uint256 usdcAmount, uint256 sharesMinted);
-    event Withdrawn(address indexed lender, uint256 usdcAmount, uint256 sharesBurned);
+    event Deposited(address indexed asset, address indexed lender, uint256 amount, uint256 sharesMinted);
+    event Withdrawn(address indexed asset, address indexed lender, uint256 amount, uint256 sharesBurned);
     event CollateralPosted(address indexed borrower, address token, uint256 amount);
-    event Borrowed(address indexed borrower, uint256 amount);
-    event Repaid(address indexed borrower, uint256 amount);
+    event Borrowed(address indexed borrower, address indexed asset, uint256 amount);
+    event Repaid(address indexed borrower, address indexed asset, uint256 amount);
     event CollateralWithdrawn(address indexed borrower, uint256 amount);
-    event InterestAccrued(uint256 totalBorrowsAfter, uint256 totalPoolValueAfter);
-    event Liquidated(address indexed borrower, address indexed liquidator, uint256 debtRepaid, uint256 collateralSeized);
+    event Liquidated(address indexed borrower, address indexed liquidator, address indexed asset, uint256 debtRepaid, uint256 collateralSeized);
+    event ParametersUpdated();
+    event Paused(bool isPaused);
+    event PriceOracleUpdated(address newOracle);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
         _;
     }
 
-    constructor(address usdcAddress, address swapAddress) {
-        usdc = IERC20(usdcAddress);
-        swapContract = IBlockSwap(swapAddress);
-        owner = msg.sender;
-        lastAccrualTime = block.timestamp;
+    modifier whenNotPaused() {
+        require(!paused, "New deposits and borrows are currently paused");
+        _;
     }
 
-    function _accrueInterest() internal {
-        if (block.timestamp == lastAccrualTime) return;
-        uint256 elapsed = block.timestamp - lastAccrualTime;
+    constructor(address usdcAddress, address swapAddress) {
+        usdc = usdcAddress;
+        swapContract = IBlockSwap(swapAddress);
+        owner = msg.sender;
+        _initPool(usdcAddress);
+    }
 
-        uint256 currentBorrows = (totalBorrowPrincipalScaled * borrowIndex) / INDEX_PRECISION;
-        if (currentBorrows > 0) {
-            uint256 interestAccrued = (currentBorrows * BORROW_APR_BPS * elapsed) / (10000 * SECONDS_PER_YEAR);
-            borrowIndex += (borrowIndex * interestAccrued) / currentBorrows;
-            totalPoolValue += interestAccrued;
-            emit InterestAccrued(currentBorrows + interestAccrued, totalPoolValue);
+    function _initPool(address asset) internal {
+        if (!pools[asset].initialized) {
+            pools[asset].initialized = true;
+            pools[asset].borrowIndex = INDEX_PRECISION;
+            pools[asset].lastAccrualTime = block.timestamp;
         }
-        lastAccrualTime = block.timestamp;
+    }
+
+    // ── Owner controls ───────────────────────────────────────────
+
+    function setRiskParameters(
+        uint256 newLtvBps, uint256 newLiquidationThresholdBps, uint256 newLiquidationBonusBps,
+        uint256 newBorrowAprBps, uint256 newMaxUtilizationBps
+    ) external onlyOwner {
+        require(newLtvBps < newLiquidationThresholdBps, "LTV must stay below the liquidation threshold");
+        require(newLiquidationThresholdBps <= 10000, "Invalid threshold");
+        require(newMaxUtilizationBps <= 10000, "Invalid utilization cap");
+        ltvBps = newLtvBps;
+        liquidationThresholdBps = newLiquidationThresholdBps;
+        liquidationBonusBps = newLiquidationBonusBps;
+        borrowAprBps = newBorrowAprBps;
+        maxUtilizationBps = newMaxUtilizationBps;
+        emit ParametersUpdated();
+    }
+
+    function setPaused(bool isPaused) external onlyOwner {
+        paused = isPaused;
+        emit Paused(isPaused);
+    }
+
+    function setPriceOracle(address newOracle) external onlyOwner {
+        require(newOracle != address(0), "Invalid oracle address");
+        swapContract = IBlockSwap(newOracle);
+        emit PriceOracleUpdated(newOracle);
+    }
+
+    function withdrawReserve(address asset, uint256 amount, address to) external onlyOwner {
+        require(to != address(0), "Invalid recipient");
+        IERC20(asset).transfer(to, amount);
+    }
+
+    // ── Interest accrual, per-pool ───────────────────────────────
+
+    function _accrueInterest(address asset) internal {
+        AssetPool storage pool = pools[asset];
+        if (block.timestamp == pool.lastAccrualTime) return;
+        uint256 elapsed = block.timestamp - pool.lastAccrualTime;
+
+        uint256 currentBorrows = (pool.totalBorrowPrincipalScaled * pool.borrowIndex) / INDEX_PRECISION;
+        if (currentBorrows > 0) {
+            uint256 interestAccrued = (currentBorrows * borrowAprBps * elapsed) / (10000 * SECONDS_PER_YEAR);
+            pool.borrowIndex += (pool.borrowIndex * interestAccrued) / currentBorrows;
+            pool.totalPoolValue += interestAccrued;
+        }
+        pool.lastAccrualTime = block.timestamp;
     }
 
     function currentDebt(address borrower) public view returns (uint256) {
         Position storage pos = positions[borrower];
         if (pos.borrowScaled == 0) return 0;
-        uint256 elapsed = block.timestamp - lastAccrualTime;
-        uint256 projectedIndex = borrowIndex;
+        AssetPool storage pool = pools[pos.borrowedAsset];
+        uint256 elapsed = block.timestamp - pool.lastAccrualTime;
+        uint256 projectedIndex = pool.borrowIndex;
         if (elapsed > 0) {
-            uint256 currentBorrows = (totalBorrowPrincipalScaled * borrowIndex) / INDEX_PRECISION;
+            uint256 currentBorrows = (pool.totalBorrowPrincipalScaled * pool.borrowIndex) / INDEX_PRECISION;
             if (currentBorrows > 0) {
-                uint256 interestAccrued = (currentBorrows * BORROW_APR_BPS * elapsed) / (10000 * SECONDS_PER_YEAR);
-                projectedIndex += (borrowIndex * interestAccrued) / currentBorrows;
+                uint256 interestAccrued = (currentBorrows * borrowAprBps * elapsed) / (10000 * SECONDS_PER_YEAR);
+                projectedIndex += (pool.borrowIndex * interestAccrued) / currentBorrows;
             }
         }
         return (pos.borrowScaled * projectedIndex) / INDEX_PRECISION;
     }
 
-    // ── Lender side ──────────────────────────────────────────────
+    // ── Lender side, works for any of the 4 assets ──────────────
 
-    function deposit(uint256 amount) external {
+    function deposit(address asset, uint256 amount) external whenNotPaused {
         require(amount > 0, "Invalid amount");
-        _accrueInterest();
+        _initPool(asset);
+        _accrueInterest(asset);
+        AssetPool storage pool = pools[asset];
 
-        uint256 sharesToMint;
-        if (totalShares == 0) {
-            sharesToMint = amount;
-        } else {
-            sharesToMint = (amount * totalShares) / totalPoolValue;
-        }
+        uint256 sharesToMint = pool.totalShares == 0
+            ? amount
+            : (amount * pool.totalShares) / pool.totalPoolValue;
 
-        usdc.transferFrom(msg.sender, address(this), amount);
-        lenderShares[msg.sender] += sharesToMint;
-        totalShares += sharesToMint;
-        totalPoolValue += amount;
+        IERC20(asset).transferFrom(msg.sender, address(this), amount);
+        lenderShares[asset][msg.sender] += sharesToMint;
+        pool.totalShares += sharesToMint;
+        pool.totalPoolValue += amount;
 
-        emit Deposited(msg.sender, amount, sharesToMint);
+        emit Deposited(asset, msg.sender, amount, sharesToMint);
     }
 
-    function withdraw(uint256 shareAmount) external {
-        _accrueInterest();
-        require(lenderShares[msg.sender] >= shareAmount, "Insufficient share balance");
+    function withdraw(address asset, uint256 shareAmount) external {
+        _accrueInterest(asset);
+        AssetPool storage pool = pools[asset];
+        require(lenderShares[asset][msg.sender] >= shareAmount, "Insufficient share balance");
 
-        uint256 usdcOwed = (shareAmount * totalPoolValue) / totalShares;
-        uint256 availableLiquidity = usdc.balanceOf(address(this));
-        require(availableLiquidity >= usdcOwed, "Not enough liquidity in the pool right now");
+        uint256 owed = (shareAmount * pool.totalPoolValue) / pool.totalShares;
+        uint256 available = IERC20(asset).balanceOf(address(this));
+        require(available >= owed, "Not enough liquidity in this pool right now");
 
-        lenderShares[msg.sender] -= shareAmount;
-        totalShares -= shareAmount;
-        totalPoolValue -= usdcOwed;
+        lenderShares[asset][msg.sender] -= shareAmount;
+        pool.totalShares -= shareAmount;
+        pool.totalPoolValue -= owed;
 
-        usdc.transfer(msg.sender, usdcOwed);
-        emit Withdrawn(msg.sender, usdcOwed, shareAmount);
+        IERC20(asset).transfer(msg.sender, owed);
+        emit Withdrawn(asset, msg.sender, owed, shareAmount);
     }
 
-    function lenderBalance(address lender) external view returns (uint256) {
-        if (totalShares == 0) return 0;
-        return (lenderShares[lender] * totalPoolValue) / totalShares;
+    function lenderBalance(address asset, address lender) external view returns (uint256) {
+        AssetPool storage pool = pools[asset];
+        if (pool.totalShares == 0) return 0;
+        return (lenderShares[asset][lender] * pool.totalPoolValue) / pool.totalShares;
     }
 
-    // ── Borrower side ────────────────────────────────────────────
+    // ── Price conversion ─────────────────────────────────────────
+    // Values `amount` of `fromToken` in terms of `toToken`. Direct
+    // pool lookup when either side is USDC (the hub every pool is
+    // built around); a genuine two-hop conversion through USDC when
+    // neither side is — the exact same routing principle your Swap
+    // page already uses, just applied to a valuation instead of an
+    // actual trade.
 
-    function getCollateralValueUsdc(address token, uint256 amount) public view returns (uint256) {
+    function _valueInUsdc(address token, uint256 amount) internal view returns (uint256) {
+        if (token == usdc) return amount;
         (uint256 reserveUsdc, uint256 reserveToken, ) = swapContract.getPool(token);
         require(reserveToken > 0, "No pool liquidity for this token");
         return (amount * reserveUsdc) / reserveToken;
     }
 
-    function postCollateral(address token, uint256 amount) external {
+    function _valueFromUsdc(address token, uint256 usdcAmount) internal view returns (uint256) {
+        if (token == usdc) return usdcAmount;
+        (uint256 reserveUsdc, uint256 reserveToken, ) = swapContract.getPool(token);
+        require(reserveUsdc > 0, "No pool liquidity for this token");
+        return (usdcAmount * reserveToken) / reserveUsdc;
+    }
+
+    function convertValue(address fromToken, uint256 amount, address toToken) public view returns (uint256) {
+        if (fromToken == toToken) return amount;
+        uint256 usdcValue = _valueInUsdc(fromToken, amount);
+        return _valueFromUsdc(toToken, usdcValue);
+    }
+
+    // ── Borrower side ────────────────────────────────────────────
+
+    function postCollateral(address token, uint256 amount) external whenNotPaused {
         require(amount > 0, "Invalid amount");
         Position storage pos = positions[msg.sender];
         require(pos.collateralAmount == 0 || pos.collateralToken == token, "Already have different collateral posted");
@@ -181,53 +267,69 @@ contract BlockLend {
         emit CollateralPosted(msg.sender, token, amount);
     }
 
-    function maxBorrowable(address borrower) public view returns (uint256) {
+    // Max additional amount of `asset` this borrower could take out
+    // right now, valued in `asset`'s own terms.
+    function maxBorrowable(address borrower, address asset) public view returns (uint256) {
         Position storage pos = positions[borrower];
         if (pos.collateralAmount == 0) return 0;
-        uint256 collateralValue = getCollateralValueUsdc(pos.collateralToken, pos.collateralAmount);
-        uint256 maxTotal = (collateralValue * LTV_BPS) / 10000;
+        if (pos.borrowedAsset != address(0) && pos.borrowedAsset != asset) return 0; // already borrowing a different asset
+
+        uint256 collateralValueInAsset = convertValue(pos.collateralToken, pos.collateralAmount, asset);
+        uint256 maxTotal = (collateralValueInAsset * ltvBps) / 10000;
         uint256 owed = currentDebt(borrower);
         if (maxTotal <= owed) return 0;
         return maxTotal - owed;
     }
 
-    function borrow(uint256 amount) external {
+    function borrow(address asset, uint256 amount) external whenNotPaused {
         require(amount > 0, "Invalid amount");
-        _accrueInterest();
-        require(amount <= maxBorrowable(msg.sender), "Exceeds your available borrowing capacity");
-        uint256 availableLiquidity = usdc.balanceOf(address(this));
-        require(availableLiquidity >= amount, "Not enough liquidity in the lending pool right now");
+        _initPool(asset);
+        _accrueInterest(asset);
+        require(amount <= maxBorrowable(msg.sender, asset), "Exceeds your available borrowing capacity");
 
-        uint256 scaledAmount = (amount * INDEX_PRECISION) / borrowIndex;
-        positions[msg.sender].borrowScaled += scaledAmount;
-        totalBorrowPrincipalScaled += scaledAmount;
+        AssetPool storage pool = pools[asset];
+        uint256 available = IERC20(asset).balanceOf(address(this));
+        require(available >= amount, "Not enough liquidity in this lending pool right now");
 
-        usdc.transfer(msg.sender, amount);
-        emit Borrowed(msg.sender, amount);
+        uint256 currentBorrows = (pool.totalBorrowPrincipalScaled * pool.borrowIndex) / INDEX_PRECISION;
+        require(
+            (currentBorrows + amount) * 10000 <= pool.totalPoolValue * maxUtilizationBps,
+            "This would push pool utilization above the safe limit"
+        );
+
+        Position storage pos = positions[msg.sender];
+        pos.borrowedAsset = asset;
+        uint256 scaledAmount = (amount * INDEX_PRECISION) / pool.borrowIndex;
+        pos.borrowScaled += scaledAmount;
+        pool.totalBorrowPrincipalScaled += scaledAmount;
+
+        IERC20(asset).transfer(msg.sender, amount);
+        emit Borrowed(msg.sender, asset, amount);
     }
 
     function repay(uint256 amount) external {
-        _accrueInterest();
         Position storage pos = positions[msg.sender];
+        address asset = pos.borrowedAsset;
+        _accrueInterest(asset);
         uint256 owed = currentDebt(msg.sender);
         require(amount > 0 && amount <= owed, "Invalid repay amount");
 
-        usdc.transferFrom(msg.sender, address(this), amount);
-        _reduceDebt(pos, amount);
+        IERC20(asset).transferFrom(msg.sender, address(this), amount);
+        _reduceDebt(pos, asset, amount);
 
-        emit Repaid(msg.sender, amount);
+        emit Repaid(msg.sender, asset, amount);
     }
 
     function withdrawCollateral(uint256 amount) external {
-        _accrueInterest();
         Position storage pos = positions[msg.sender];
+        if (pos.borrowedAsset != address(0)) _accrueInterest(pos.borrowedAsset);
         require(amount > 0 && amount <= pos.collateralAmount, "Invalid amount");
 
         uint256 remaining = pos.collateralAmount - amount;
         uint256 owed = currentDebt(msg.sender);
         if (owed > 0) {
-            uint256 remainingValue = getCollateralValueUsdc(pos.collateralToken, remaining);
-            uint256 maxAllowed = (remainingValue * LTV_BPS) / 10000;
+            uint256 remainingValueInBorrowed = convertValue(pos.collateralToken, remaining, pos.borrowedAsset);
+            uint256 maxAllowed = (remainingValueInBorrowed * ltvBps) / 10000;
             require(maxAllowed >= owed, "Would leave your borrow undercollateralized");
         }
 
@@ -236,10 +338,11 @@ contract BlockLend {
         emit CollateralWithdrawn(msg.sender, amount);
     }
 
-    function _reduceDebt(Position storage pos, uint256 usdcAmount) internal {
-        uint256 scaledRepaid = (usdcAmount * INDEX_PRECISION) / borrowIndex;
+    function _reduceDebt(Position storage pos, address asset, uint256 amount) internal {
+        AssetPool storage pool = pools[asset];
+        uint256 scaledRepaid = (amount * INDEX_PRECISION) / pool.borrowIndex;
         pos.borrowScaled -= scaledRepaid > pos.borrowScaled ? pos.borrowScaled : scaledRepaid;
-        totalBorrowPrincipalScaled -= scaledRepaid > totalBorrowPrincipalScaled ? totalBorrowPrincipalScaled : scaledRepaid;
+        pool.totalBorrowPrincipalScaled -= scaledRepaid > pool.totalBorrowPrincipalScaled ? pool.totalBorrowPrincipalScaled : scaledRepaid;
     }
 
     // ── Liquidations ─────────────────────────────────────────────
@@ -247,37 +350,27 @@ contract BlockLend {
     function isLiquidatable(address borrower) public view returns (bool) {
         Position storage pos = positions[borrower];
         if (pos.borrowScaled == 0) return false;
-        uint256 collateralValue = getCollateralValueUsdc(pos.collateralToken, pos.collateralAmount);
+        uint256 collateralValueInBorrowed = convertValue(pos.collateralToken, pos.collateralAmount, pos.borrowedAsset);
         uint256 debt = currentDebt(borrower);
-        uint256 threshold = (collateralValue * LIQUIDATION_THRESHOLD_BPS) / 10000;
+        uint256 threshold = (collateralValueInBorrowed * liquidationThresholdBps) / 10000;
         return debt > threshold;
     }
 
-    // Anyone can call this on an unsafe position. The caller repays
-    // some or all of the borrower's debt directly, and receives that
-    // value back in the borrower's collateral token, PLUS the 8%
-    // bonus — real, immediate profit for keeping the system solvent.
     function liquidate(address borrower, uint256 repayAmount) external {
-        _accrueInterest();
+        Position storage pos = positions[borrower];
+        address asset = pos.borrowedAsset;
+        _accrueInterest(asset);
         require(isLiquidatable(borrower), "Position is healthy, cannot liquidate");
 
-        Position storage pos = positions[borrower];
         uint256 debt = currentDebt(borrower);
         require(repayAmount > 0 && repayAmount <= debt, "Invalid repay amount");
 
-        usdc.transferFrom(msg.sender, address(this), repayAmount);
-        _reduceDebt(pos, repayAmount);
+        IERC20(asset).transferFrom(msg.sender, address(this), repayAmount);
+        _reduceDebt(pos, asset, repayAmount);
 
-        uint256 collateralValueToSeize = (repayAmount * (10000 + LIQUIDATION_BONUS_BPS)) / 10000;
-        (uint256 reserveUsdc, uint256 reserveToken, ) = swapContract.getPool(pos.collateralToken);
-        uint256 collateralToSeize = (collateralValueToSeize * reserveToken) / reserveUsdc;
+        uint256 repayValueBonus = (repayAmount * (10000 + liquidationBonusBps)) / 10000;
+        uint256 collateralToSeize = convertValue(asset, repayValueBonus, pos.collateralToken);
 
-        // Real, honest edge case: if the position is deep enough
-        // underwater that even its full collateral doesn't cover the
-        // bonus, cap the seizure at what's actually there — the
-        // liquidator gets less than the full 8%, and the shortfall
-        // becomes uncovered bad debt for lenders. No insurance fund
-        // exists here to backstop that.
         if (collateralToSeize > pos.collateralAmount) {
             collateralToSeize = pos.collateralAmount;
         }
@@ -285,20 +378,23 @@ contract BlockLend {
         pos.collateralAmount -= collateralToSeize;
         IERC20(pos.collateralToken).transfer(msg.sender, collateralToSeize);
 
-        emit Liquidated(borrower, msg.sender, repayAmount, collateralToSeize);
+        emit Liquidated(borrower, msg.sender, asset, repayAmount, collateralToSeize);
     }
 
     // ── Views ────────────────────────────────────────────────────
 
     function getPosition(address borrower) external view returns (
-        address collateralToken, uint256 collateralAmount, uint256 borrowedAmount, uint256 availableToBorrow, bool liquidatable
+        address collateralToken, uint256 collateralAmount, address borrowedAsset,
+        uint256 borrowedAmount, bool liquidatable
     ) {
         Position storage pos = positions[borrower];
-        return (pos.collateralToken, pos.collateralAmount, currentDebt(borrower), maxBorrowable(borrower), isLiquidatable(borrower));
+        return (pos.collateralToken, pos.collateralAmount, pos.borrowedAsset, currentDebt(borrower), isLiquidatable(borrower));
     }
 
-    function withdrawReserve(uint256 amount, address to) external onlyOwner {
-        require(to != address(0), "Invalid recipient");
-        usdc.transfer(to, amount);
+    function getUtilization(address asset) external view returns (uint256) {
+        AssetPool storage pool = pools[asset];
+        if (pool.totalPoolValue == 0) return 0;
+        uint256 currentBorrows = (pool.totalBorrowPrincipalScaled * pool.borrowIndex) / INDEX_PRECISION;
+        return (currentBorrows * 10000) / pool.totalPoolValue;
     }
 }
